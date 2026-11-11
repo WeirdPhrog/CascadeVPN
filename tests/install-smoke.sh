@@ -26,7 +26,7 @@ cleanup() {
     rm -rf -- "$scratch"
 }
 trap cleanup EXIT
-# Removal leaves no Cascade file, directory, enablement link or failed unit.
+# Removal leaves no CascadeVPN file, directory, enablement link or failed unit.
 assert_removed() {
     local path
     for path in /usr/local/lib/cascade /usr/local/bin/cascade /etc/cascade /etc/systemd/system/cascade.service \
@@ -124,9 +124,17 @@ assert_removed
 # A menu left open during removal may still run the previous release, which
 # recreates a missing lock. The lock stays marked until the menu is closed.
 curl -fsSL --retry 3 -o "$scratch/old.py" \
-    https://raw.githubusercontent.com/WeirdPhrog/Cascade/309ab3d451fa2499ca5460b8d75bab96814e1c9d/cascade.py
+    https://raw.githubusercontent.com/WeirdPhrog/CascadeVPN/309ab3d451fa2499ca5460b8d75bab96814e1c9d/cascade.py
 echo "def02d8acf7d06b13a9f42e46876c4899657899fdb4083f9d9b9f217f6bd12c8  $scratch/old.py" | sha256sum --check --status
 sudo bash install.sh --no-menu
+# The branding change must accept files from releases with the old markers.
+sudo systemctl stop cascade.service
+sudo install -m 0755 "$scratch/old.py" /usr/local/lib/cascade/cascade.py
+sudo sed -i 's/^# CascadeVPN managed unit$/# Cascade managed unit/' /etc/systemd/system/cascade.service
+sudo bash install.sh --no-menu
+cmp cascade.py /usr/local/lib/cascade/cascade.py
+sudo systemctl is-active --quiet cascade.service
+grep -qx '# CascadeVPN managed unit' /etc/systemd/system/cascade.service
 # Started by a relative path from the install directory, so only the
 # process's working directory identifies it.
 menu='^python3 -I \./cascade\.py menu$'

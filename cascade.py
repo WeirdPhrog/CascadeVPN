@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I
-"""IPv4 relay: only tagged Cascade chains and hooks are modified."""
+"""IPv4 relay: only tagged CascadeVPN chains and hooks are modified."""
 import argparse
 import contextlib
 import copy
@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 TAG = "cascade:v2"
 CHAINS = {"nat": ("CSCD_DNAT", "CSCD_SNAT"), "filter": ("CSCD_FWD",)}
 STATE = Path("/etc/cascade/state.json")
@@ -186,7 +186,7 @@ def owned(table, snapshot):
             hooks.append(line)
     for name, lines in content.items():
         if not lines:
-            raise Error(f"Цепочка {name} уже существует без меток Cascade.")
+            raise Error(f"Цепочка {name} уже существует без меток CascadeVPN.")
     return {"chains": content, "hooks": hooks}
 
 
@@ -262,7 +262,7 @@ class Firewall:
 
     def preflight(self):
         if self.backend != self.default:
-            raise Error("Системный backend iptables изменён. Верните прежний backend или удалите правила Cascade.")
+            raise Error("Системный backend iptables изменён. Верните прежний backend или удалите правила CascadeVPN.")
         other = "iptables-" + ("legacy" if self.backend == "nft" else "nft") + "-save"
         if shutil.which(other, path=SAFE_PATH):
             text = run([other]).stdout
@@ -500,7 +500,7 @@ def transition(old, new, *, save=True, check=True):
     if enabled and snapshot["filter"]["chains"].get("FORWARD") != "DROP":
         print("Внимание: включён net.ipv4.ip_forward, а политика FORWARD не DROP. Сервер будет "
               "пересылать и другой транзитный трафик, который на него направят. Если это не нужно, "
-              "ограничьте FORWARD своим firewall: разрешения Cascade стоят раньше политики.", file=sys.stderr)
+              "ограничьте FORWARD своим firewall: разрешения CascadeVPN стоят раньше политики.", file=sys.stderr)
 
 
 @contextlib.contextmanager
@@ -511,13 +511,13 @@ def locked(*, allow_disabled=False):
     try:
         fd = os.open(STATE.parent / ".lock", os.O_RDWR | os.O_NOFOLLOW)
     except FileNotFoundError as exc:
-        raise Error("Cascade не установлен. Для установки запустите install.sh.") from exc
+        raise Error("CascadeVPN не установлен. Для установки запустите install.sh.") from exc
     with os.fdopen(fd, "r+", encoding="utf-8") as lock:
         os.fchmod(lock.fileno(), 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
         lock.seek(0)
         if lock.read().strip() and not allow_disabled:
-            raise Error("Cascade удаляется или уже удалён. Для установки запустите install.sh.")
+            raise Error("CascadeVPN удаляется или уже удалён. Для установки запустите install.sh.")
         yield lock
 
 
@@ -525,7 +525,7 @@ def display(state):
     for n, item in enumerate(state["rules"], 1):
         print(f"{n}. {item['proto']} {item['listen']}:{item['incoming']} -> {item['target']}:{item['outgoing']}")
     if not state["rules"]:
-        print("Правил Cascade нет.")
+        print("Правил CascadeVPN нет.")
 
 
 def execute(args):
@@ -558,7 +558,7 @@ def execute(args):
             item = rule(args.proto, listen, incoming, target, outgoing)
             existing = next((r for r in old["rules"] if key(r) == key(item)), None)
             if existing and existing != item and not args.replace:
-                raise Error("Этот входящий адрес/порт занят правилом Cascade. Для замены укажите --replace.")
+                raise Error("Этот входящий адрес/порт занят правилом CascadeVPN. Для замены укажите --replace.")
             new["rules"] = [r for r in new["rules"] if key(r) != key(item)] + [item]
             transition(old, new)
         elif args.command == "delete":
@@ -578,7 +578,7 @@ def execute(args):
 
 
 def parser():
-    root = argparse.ArgumentParser(description="Cascade — каскадный IPv4 TCP/UDP relay")
+    root = argparse.ArgumentParser(description="CascadeVPN — каскадный IPv4 TCP/UDP relay")
     root.add_argument("--version", action="version", version=VERSION)
     sub = root.add_subparsers(dest="command")
     for name in ("list", "status", "apply", "stop", "menu"):
@@ -623,9 +623,9 @@ def ask(label, validate):
 
 def menu():
     while True:
-        print("\nCascade\n1) AmneziaWG / WireGuard (UDP)\n2) VLESS / XRay (TCP)\n"
+        print("\nCascadeVPN\n1) AmneziaWG / WireGuard (UDP)\n2) VLESS / XRay (TCP)\n"
               "3) MTProto (TCP)\n4) Произвольные TCP/UDP порты\n5) Список\n"
-              "6) Удалить правило\n7) Удалить все правила Cascade\n8) Инструкция\n0) Выход")
+              "6) Удалить правило\n7) Удалить все правила CascadeVPN\n8) Инструкция\n0) Выход")
         choice = input("> ").strip()
         try:
             if choice == "0":
@@ -645,7 +645,7 @@ def menu():
                     with locked():
                         state = load()
                         if any(key(r) == key(item) for r in state["rules"]):
-                            raise Error("Этот входящий порт уже используется Cascade.")
+                            raise Error("Этот входящий порт уже используется CascadeVPN.")
                         check_ports([item], Firewall(state["backend"]).snapshot(), strict={key(item)})
                 incoming = ask("Входящий порт: ", validate_incoming)
                 outgoing = ask("Порт назначения (Enter — как входящий): ", lambda value: port(value or incoming)) or incoming
@@ -668,13 +668,13 @@ def menu():
                     raise Error("Неверный номер правила.")
                 remove_rule(state["rules"][int(value) - 1])
                 print("Готово.")
-            elif choice == "7" and input("Удалить только правила Cascade? [yes]: ") == "yes":
+            elif choice == "7" and input("Удалить только правила CascadeVPN? [yes]: ") == "yes":
                 execute(parser().parse_args(["clear", "--yes"]))
             elif choice == "8":
                 print("Создайте правило на промежуточном VPS. В клиенте замените endpoint на публичный IP этого "
                       "VPS и входящий порт. Ключи, UUID и TLS/SNI остаются от конечного VPN. "
                       "Другие сервисы должны использовать другие входящие порты. "
-                      "Документация: https://github.com/WeirdPhrog/Cascade")
+                      "Документация: https://github.com/WeirdPhrog/CascadeVPN")
         except Interrupted:
             raise
         except (Error, OSError, ValueError, subprocess.SubprocessError) as exc:

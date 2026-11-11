@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -21,11 +22,11 @@ def main():
     original_config = CONFIG.read_bytes() if CONFIG.exists() else None
     config = json.loads(original_config or b"{}")
     config["userland-proxy"] = False
-    CONFIG.write_text(json.dumps(config))
-    run("systemctl", "restart", "docker")
     processes = []
     state = None
     try:
+        CONFIG.write_text(json.dumps(config))
+        run("systemctl", "restart", "docker")
         # Container rules reproduce Amnezia's FORWARD/MASQUERADE setup, while
         # an echo service lets us verify packet delivery without VPN credentials.
         run("docker", "build", "-t", "cascade-vpn-fixture", "-f", "tests/Dockerfile.vpn", str(ROOT))
@@ -79,7 +80,7 @@ def main():
                     add(proto, 24443)
                     connect(proto, 24443)
                     connect(proto, 45010)
-                # Restart the real daemon without re-applying Cascade afterwards.
+                # Restart the real daemon without re-applying CascadeVPN afterwards.
                 run("systemctl", "restart", "docker")
                 for _ in range(60):
                     if run("docker", "inspect", "-f", "{{.State.Running}}", CONTAINER).stdout.strip() == "true":
@@ -107,6 +108,17 @@ def main():
                 print("PASS: real Docker without proxy, stopped-port reservation, TCP/UDP coexistence, daemon restart, scoped removal")
             finally:
                 command("clear", "--yes", ok=False)
+    except BaseException:
+        # Capture the failure before cleanup changes Docker's state. A failed
+        # restart alone does not tell us whether the daemon or the test failed.
+        for args in (("systemctl", "status", "docker.service", "docker.socket", "--no-pager", "--full"),
+                     ("journalctl", "-u", "docker.service", "-u", "docker.socket", "-n", "150", "--no-pager")):
+            try:
+                result = run(*args, ok=False)
+                print(result.stdout + result.stderr, file=sys.stderr, flush=True)
+            except (OSError, subprocess.SubprocessError) as diagnostic_error:
+                print(f"Docker diagnostics failed: {diagnostic_error}", file=sys.stderr)
+        raise
     finally:
         for p in processes:
             p.terminate()

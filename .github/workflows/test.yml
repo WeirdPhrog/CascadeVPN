@@ -1,4 +1,4 @@
-name: Verify Cascade
+name: Verify CascadeVPN
 on:
   push:
   pull_request:

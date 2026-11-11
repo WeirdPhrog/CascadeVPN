@@ -1,10 +1,10 @@
 #!/bin/bash
-# Install the Cascade manager and systemd service.
+# Install the CascadeVPN manager and systemd service.
 set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
-REPO=https://raw.githubusercontent.com/WeirdPhrog/Cascade/main
-EXPECTED_SHA256=11c550109fe70fc96de1e8d26f4e30c77d3b260805ae3cebea75647d5636ecf3
+REPO=https://raw.githubusercontent.com/WeirdPhrog/CascadeVPN/main
+EXPECTED_SHA256=5bd87f29dc843fe86ee01f0f00d7f5504a3e6a384b0e1e76faed00fa90953410
 LIBDIR=/usr/local/lib/cascade
 PROGRAM=$LIBDIR/cascade.py
 COMMAND=/usr/local/bin/cascade
@@ -50,11 +50,12 @@ if [[ -e /usr/local/bin/cascade || -L /usr/local/bin/cascade ]]; then
         echo 'Файл /usr/local/bin/cascade принадлежит другой программе.' >&2; exit 1;
     }
 fi
-if [[ -e $UNIT ]] && ! grep -q '^# Cascade managed unit$' "$UNIT"; then
-    echo "Файл $UNIT не принадлежит Cascade." >&2; exit 1
+if [[ -e $UNIT ]] && ! grep -Eq '^# Cascade(VPN)? managed unit$' "$UNIT"; then
+    echo "Файл $UNIT не принадлежит CascadeVPN." >&2; exit 1
 fi
-if [[ -e $PROGRAM ]] && ! grep -Fxq '"""IPv4 relay: only tagged Cascade chains and hooks are modified."""' "$PROGRAM"; then
-    echo "Файл $PROGRAM не принадлежит Cascade." >&2; exit 1
+if [[ -e $PROGRAM ]] && ! grep -Fxq -e '"""IPv4 relay: only tagged CascadeVPN chains and hooks are modified."""' \
+    -e '"""IPv4 relay: only tagged Cascade chains and hooks are modified."""' "$PROGRAM"; then
+    echo "Файл $PROGRAM не принадлежит CascadeVPN." >&2; exit 1
 fi
 
 # BEGIN REMOVAL HELPERS (tests/install-functions.sh runs them with stub commands)
@@ -73,7 +74,7 @@ legacy_tables_absent() {
     tables=$(cat -- "$LEGACY_TABLES" 2>/dev/null) && [[ -z $tables ]]
 }
 
-# Returns 0 if Cascade rules exist, 1 if there are none, 2 if unknown.
+# Returns 0 if CascadeVPN rules exist, 1 if there are none, 2 if unknown.
 rules_present() {
     local save output status=0 result=1
     if [[ -e $CONFIG/state.json ]]; then
@@ -107,7 +108,7 @@ sys.exit(3 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' "
     return "$result"
 }
 
-# PIDs of running Cascade managers (open menus or commands), one per line.
+# PIDs of running CascadeVPN managers (open menus or commands), one per line.
 # A false match only keeps the lock file, so matching is deliberately broad:
 # any root Python process with an argument named cascade.py (an installed
 # file, a copy or a clone), or with a path that resolves to the program or
@@ -139,7 +140,7 @@ deactivate() {
     exec 8>>"$CONFIG/.lock" || return 1
     if ! flock -w 90 8; then
         exec 8>&-
-        echo "Блокировку $CONFIG/.lock не отпускает другой процесс Cascade (PID: $(cascade_processes | tr '\n' ' '))." \
+        echo "Блокировку $CONFIG/.lock не отпускает другой процесс CascadeVPN (PID: $(cascade_processes | tr '\n' ' '))." \
             'Закройте его и повторите удаление.' >&2
         return 1
     fi
@@ -150,7 +151,7 @@ deactivate() {
     exec 8>&-
 }
 
-# Only Cascade's own files are removed; foreign files were rejected above.
+# Only CascadeVPN's own files are removed; foreign files were rejected above.
 remove_files() {
     local pids dir
     if [[ -L $WANTS && $(readlink "$WANTS") == "$UNIT" ]]; then
@@ -168,7 +169,7 @@ remove_files() {
     # recreate a missing lock without the removal mark and keep working.
     pids=$(cascade_processes) || return 1
     if [[ -n $pids ]]; then
-        echo "Открыты процессы Cascade (PID: ${pids//$'\n'/ })." \
+        echo "Открыты процессы CascadeVPN (PID: ${pids//$'\n'/ })." \
             "$CONFIG/.lock оставлен с отметкой удаления: они не смогут изменить firewall." \
             'Закройте их и повторите удаление, чтобы убрать и этот файл.' >&2
     else
@@ -199,7 +200,7 @@ uninstall() {
     if [[ $found != 1 ]]; then
         if [[ ! -f $PROGRAM ]]; then
             if [[ $found == 0 ]]; then
-                echo "Найдены правила Cascade, но нет $PROGRAM. Запустите установку, затем удаление." >&2
+                echo "Найдены правила CascadeVPN, но нет $PROGRAM. Запустите установку, затем удаление." >&2
             fi
             return 1
         fi
@@ -218,12 +219,12 @@ uninstall() {
 }
 # END REMOVAL HELPERS
 
-# A firewall snapshot saved while Cascade was active would restore it at boot.
+# A firewall snapshot saved while CascadeVPN was active would restore it at boot.
 warn_saved() {
     local file
     for file in /etc/iptables/rules.v4 /etc/iptables.rules /etc/iptables.up.rules; do
         if [[ -f $file ]] && grep -Eq 'cascade:v2|^:CSCD_(DNAT|SNAT|FWD) ' "$file"; then
-            echo "Внимание: $file содержит правила или цепочки Cascade; загрузчик firewall вернёт их после перезагрузки." >&2
+            echo "Внимание: $file содержит правила или цепочки CascadeVPN; загрузчик firewall вернёт их после перезагрузки." >&2
             echo 'Пересохраните текущие правила (например, sudo netfilter-persistent save) или удалите из файла' \
                 'строки с cascade:v2 и объявления цепочек :CSCD_DNAT, :CSCD_SNAT, :CSCD_FWD.' >&2
         fi
@@ -241,21 +242,21 @@ if [[ $ACTION == uninstall ]]; then
         found=0
         rules_present || found=$?
         if [[ $found == 1 ]]; then
-            echo 'Cascade не установлен.'
+            echo 'CascadeVPN не установлен.'
             warn_saved
             exit 0
         fi
-        [[ $found == 2 ]] || echo 'Cascade не установлен, но в firewall есть правила с меткой cascade:v2. Установите Cascade и запустите удаление.' >&2
+        [[ $found == 2 ]] || echo 'CascadeVPN не установлен, но в firewall есть правила с меткой cascade:v2. Установите CascadeVPN и запустите удаление.' >&2
         warn_saved
         exit 1
     fi
     if ! uninstall; then
         echo 'Удаление не завершено (см. ошибку выше). Устраните её и повторите удаление;' \
-            'чтобы вернуть Cascade в работу, запустите установку.' >&2
+            'чтобы вернуть CascadeVPN в работу, запустите установку.' >&2
         exit 1
     fi
     warn_saved
-    echo 'Cascade удалён. Системные пакеты и чужой firewall сохранены.'
+    echo 'CascadeVPN удалён. Системные пакеты и чужой firewall сохранены.'
     exit 0
 fi
 
@@ -284,9 +285,9 @@ printf '%s  %s\n' "$EXPECTED_SHA256" "$scratch/cascade.py" | sha256sum --check -
 }
 /usr/bin/python3 -I "$scratch/cascade.py" --version
 cat > "$scratch/cascade.service" <<'UNIT'
-# Cascade managed unit
+# CascadeVPN managed unit
 [Unit]
-Description=Cascade IPv4 TCP/UDP relay
+Description=CascadeVPN IPv4 TCP/UDP relay
 Wants=network-online.target
 After=network-online.target nftables.service netfilter-persistent.service ufw.service firewalld.service docker.service
 # Retry for several minutes if an address or route appears late after boot.
@@ -330,7 +331,7 @@ rollback() {
     set +e
     journalctl -u cascade.service -n 30 --no-pager >&2
     if [[ $had_program == 0 ]]; then
-        # Cascade was not installed before: remove everything this run created.
+        # CascadeVPN was not installed before: remove everything this run created.
         if uninstall; then
             echo 'Установка не завершена; созданные файлы удалены. Проверьте ошибки выше.' >&2
         else
@@ -375,7 +376,7 @@ else
     systemctl start cascade.service
 fi
 trap - ERR INT TERM
-echo 'Cascade установлен. Команда: cascade; справка: cascade --help'
+echo 'CascadeVPN установлен. Команда: cascade; справка: cascade --help'
 if [[ $NO_MENU == 0 && -t 0 ]]; then
     flock -u 9
     exec /usr/bin/python3 -I "$PROGRAM" menu

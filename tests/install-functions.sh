@@ -112,7 +112,7 @@ legacy_missing 2                          # the list exists but cannot be read
 command rm -rf -- "$LEGACY_TABLES"
 (LEGACY_TABLES=$work/no-proc-net/ip_tables_names; legacy_missing 2)  # /proc/net itself is missing
 
-# Every way to start a Cascade manager is found in a model of /proc.
+# Every way to start a CascadeVPN manager is found in a model of /proc.
 reset
 proc_entry() {  # pid cwd argv...
     local pid=$1 cwd=$2
@@ -124,7 +124,7 @@ proc_entry() {  # pid cwd argv...
 mkdir -p "$LIBDIR" "${COMMAND%/*}"
 proc_entry 101 "$LIBDIR" python3 -I ./cascade.py menu  # relative, from the install dir
 proc_entry 102 / /usr/bin/python3 -I "$COMMAND"         # the cascade command
-proc_entry 103 / python3 /root/Cascade/cascade.py menu  # a clone or copy
+proc_entry 103 / python3 /root/CascadeVPN/cascade.py menu  # a clone or copy
 proc_entry 104 "${COMMAND%/*}" python3.11 -I ./cascade  # relative command path
 proc_entry 105 "$LIBDIR" python3 -I ../lib/cascade.py
 proc_entry 106 / /usr/bin/python "$COMMAND" menu        # python-is-python3
@@ -183,7 +183,7 @@ installed
 touch "$work/reload.fails"
 expect 1 uninstall
 
-# An open Cascade process keeps the lock with the removal mark.
+# An open CascadeVPN process keeps the lock with the removal mark.
 installed
 echo 4242 >"$work/processes"
 expect 0 uninstall
