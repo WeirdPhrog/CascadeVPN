@@ -95,15 +95,22 @@ expect 0 rules_present
 echo '{broken' >"$CONFIG/state.json"
 expect 2 rules_present
 # A missing iptables-save proves nothing, except for legacy rules when the
-# kernel lists no legacy tables. Real binaries live in /usr/sbin, so a PATH
-# without it hides them while keeping coreutils.
+# kernel provably has no legacy tables. Real binaries live in /usr/sbin, so a
+# PATH without it hides them while keeping coreutils.
 reset
 (unset -f iptables-nft-save; PATH=/usr/bin:/bin; expect 2 rules_present)
-(unset -f iptables-legacy-save; PATH=/usr/bin:/bin; expect 1 rules_present)
-echo filter >"$LEGACY_TABLES"
-(unset -f iptables-legacy-save; PATH=/usr/bin:/bin; expect 2 rules_present)
-command rm -f -- "$LEGACY_TABLES"
 (unset -f iptables-nft-save iptables-legacy-save; PATH=/usr/bin:/bin; expect 2 rules_present)
+legacy_missing() { (unset -f iptables-legacy-save; PATH=/usr/bin:/bin; expect "$1" rules_present); }
+legacy_missing 1                          # no list in /proc/net: ip_tables is not loaded
+: >"$LEGACY_TABLES"
+legacy_missing 1                          # list read and empty
+echo filter >"$LEGACY_TABLES"
+legacy_missing 2                          # legacy tables exist
+command rm -f -- "$LEGACY_TABLES"
+mkdir -- "$LEGACY_TABLES"
+legacy_missing 2                          # the list exists but cannot be read
+command rm -rf -- "$LEGACY_TABLES"
+(LEGACY_TABLES=$work/no-proc-net/ip_tables_names; legacy_missing 2)  # /proc/net itself is missing
 
 # Every way to start a Cascade manager is found in a model of /proc.
 reset

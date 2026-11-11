@@ -61,6 +61,18 @@ fi
 # Every helper reports failure through its status: callers use them in
 # conditions, where set -e does not apply.
 
+# True only when the kernel provably has no legacy (ip_tables) tables:
+# their list was read and is empty, or it does not exist although /proc/net
+# does, because the ip_tables module is not loaded. A read error proves nothing.
+legacy_tables_absent() {
+    local tables
+    if [[ ! -e $LEGACY_TABLES ]]; then
+        [[ -d ${LEGACY_TABLES%/*} ]]
+        return
+    fi
+    tables=$(cat -- "$LEGACY_TABLES" 2>/dev/null) && [[ -z $tables ]]
+}
+
 # Returns 0 if Cascade rules exist, 1 if there are none, 2 if unknown.
 rules_present() {
     local save output status=0 result=1
@@ -76,10 +88,10 @@ sys.exit(3 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' "
     fi
     # Both variants: rules may remain in the one that is no longer selected.
     # A missing tool proves nothing (it may be removed after rules were
-    # applied), except that the kernel lists no legacy tables at all.
+    # applied), except for legacy when the kernel provably has no tables.
     for save in iptables-nft-save iptables-legacy-save; do
         if ! command -v "$save" >/dev/null; then
-            if [[ $save == iptables-legacy-save && -z $(cat -- "$LEGACY_TABLES" 2>/dev/null) ]]; then
+            if [[ $save == iptables-legacy-save ]] && legacy_tables_absent; then
                 continue
             fi
             echo "Нет $save: правила этого варианта iptables проверить нельзя." \
