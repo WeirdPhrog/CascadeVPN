@@ -1,4 +1,4 @@
-# Cascade
+# CascadeVPN
 
 Промежуточный IPv4-сервер для TCP/UDP: **клиент → ваш VPS → конечный VPN/прокси**.
 Меню на русском, команда `cascade`. Подходит для WireGuard/AmneziaWG (UDP),
