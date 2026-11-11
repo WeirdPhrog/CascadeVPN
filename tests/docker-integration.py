@@ -62,6 +62,7 @@ def main():
             connect(proto, 45010)
         with tempfile.TemporaryDirectory(prefix="cascade-docker-") as tmp:
             state = Path(tmp) / "state.json"
+            (Path(tmp) / ".lock").touch(mode=0o600)  # normally created by install.sh
             def command(*args, ok=True):
                 code = (f"import sys; from pathlib import Path; sys.path.insert(0,{str(ROOT)!r}); import cascade; "
                         f"cascade.STATE=Path({str(state)!r}); cascade.main()")

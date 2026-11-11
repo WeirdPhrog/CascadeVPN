@@ -19,12 +19,24 @@ cleanup() {
     sudo systemctl stop cascade.service 2>/dev/null || true
     sudo rm -f /etc/systemd/system/cascade.service.d/network-test.conf
     sudo rm -f /etc/systemd/system/cascade.service.d/failure-test.conf
+    sudo rm -f /etc/systemd/system/cascade.service.d/start-failure-test.conf
     sudo rmdir /etc/systemd/system/cascade.service.d 2>/dev/null || true
     sudo systemctl daemon-reload
     sudo ip netns delete "$namespace" 2>/dev/null || true
     rm -rf -- "$scratch"
 }
 trap cleanup EXIT
+# Removal leaves no Cascade file, directory, enablement link or failed unit.
+assert_removed() {
+    local path
+    for path in /usr/local/lib/cascade /usr/local/bin/cascade /etc/cascade /etc/systemd/system/cascade.service \
+        /etc/systemd/system/multi-user.target.wants/cascade.service /run/lock/cascade-install.lock; do
+        [[ ! -e $path && ! -L $path ]] || { echo "Left behind: $path" >&2; exit 1; }
+    done
+    [[ $(systemctl show -p ActiveState --value cascade.service) == inactive ]] || {
+        echo 'cascade.service is still active or failed' >&2; exit 1;
+    }
+}
 sudo ip netns add "$namespace"
 sudo ip -n "$namespace" link set lo up
 sudo ip -n "$namespace" link add relay0 type dummy
@@ -99,11 +111,28 @@ sudo ip netns exec "$namespace" iptables -t nat -S CSCD_DNAT
 sudo rm /usr/local/bin/cascade
 sudo ln -s /usr/local/lib/cascade/cascade.py /usr/local/bin/cascade
 sudo ip netns exec "$namespace" bash install.sh --uninstall
-[[ ! -e /usr/local/bin/cascade ]]
-[[ ! -e /etc/systemd/system/cascade.service ]]
+assert_removed
+if sudo ip netns exec "$namespace" iptables-save | grep -F 'cascade:v2'; then
+    echo 'Uninstall left tagged rules' >&2; exit 1
+fi
 sudo bash install.sh --uninstall
-# A subsequent clean installation must clear the deactivation barrier.
+# A subsequent clean installation must work after a complete removal.
 sudo bash install.sh --no-menu
 sudo ip netns exec "$namespace" cascade add --proto udp --listen 198.18.0.1 --in-port 45000 --target 198.18.0.2
 sudo ip netns exec "$namespace" bash install.sh --uninstall
-echo 'PASS: install, failed reinstall rollback, systemd lifecycle, foreign-file protection, removal and clean reinstall'
+assert_removed
+# A partially removed installation (program deleted by hand) is cleaned up too.
+sudo bash install.sh --no-menu
+sudo rm /usr/local/lib/cascade/cascade.py
+sudo bash install.sh --uninstall
+assert_removed
+# A failed first installation removes everything it created.
+printf '[Service]\nExecStart=\nExecStart=/bin/false\n' | sudo tee /etc/systemd/system/cascade.service.d/start-failure-test.conf
+sudo systemctl daemon-reload
+if sudo bash install.sh --no-menu; then
+    echo 'Failed start was reported as a successful install' >&2; exit 1
+fi
+assert_removed
+sudo rm /etc/systemd/system/cascade.service.d/start-failure-test.conf
+sudo systemctl daemon-reload
+echo 'PASS: install, rollback of failed reinstall and first install, systemd lifecycle, foreign-file protection, complete and partial removal'

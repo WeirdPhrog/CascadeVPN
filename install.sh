@@ -4,9 +4,10 @@ set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 REPO=https://raw.githubusercontent.com/WeirdPhrog/Cascade/main
-EXPECTED_SHA256=def02d8acf7d06b13a9f42e46876c4899657899fdb4083f9d9b9f217f6bd12c8
+EXPECTED_SHA256=81877cf5f4576074d30c4f74fe52a17548b3dabcf7e948c27c4b5c605bc0182c
 PROGRAM=/usr/local/lib/cascade/cascade.py
 UNIT=/etc/systemd/system/cascade.service
+WANTS=/etc/systemd/system/multi-user.target.wants/cascade.service
 NO_MENU=0
 ACTION=install
 case "${1:-}" in
@@ -19,7 +20,9 @@ esac
 [[ $# -le 1 ]] || exit 2
 [[ $EUID -eq 0 && $(uname -s) == Linux ]] || { echo 'Нужен Linux и sudo/root.' >&2; exit 1; }
 [[ -d /run/systemd/system ]] || { echo 'Нужна система с работающим systemd.' >&2; exit 1; }
-exec 9>/run/lock/cascade-install.lock
+# /run is writable only by root; /run/lock is world-writable on Debian/Ubuntu,
+# where another local user could pre-create or hold this file.
+exec 9>/run/cascade-install.lock
 flock -x 9
 
 # Apply the same ownership checks to installation and removal.
@@ -46,19 +49,96 @@ if [[ -e $PROGRAM ]] && ! grep -Fxq '"""IPv4 relay: only tagged Cascade chains a
     echo "Файл $PROGRAM не принадлежит Cascade." >&2; exit 1
 fi
 
+# Saved rules or tagged firewall entries can only be removed by the manager.
+needs_clear() {
+    local save output
+    if [[ -e /etc/cascade/state.json ]] && ! /usr/bin/python3 -I -c \
+        'import json, sys; sys.exit(1 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' \
+        /etc/cascade/state.json 2>/dev/null; then
+        return 0
+    fi
+    for save in iptables-nft-save iptables-legacy-save; do
+        if command -v "$save" >/dev/null && output=$("$save" 2>/dev/null) && [[ $output == *cascade:v2* ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Every later command, including one already waiting for this lock, reads the
+# mark after locking and stops. cascade.py never recreates a removed lock.
+deactivate() {
+    [[ -f /etc/cascade/.lock ]] || return 0
+    exec 8>>/etc/cascade/.lock || return 1
+    flock -x 8 || return 1
+    printf 'disabled\n' >&8 || return 1
+    exec 8>&-
+}
+
+# Only Cascade's own files are removed; foreign files were rejected above.
+remove_files() {
+    if [[ -e $UNIT ]]; then
+        systemctl disable cascade.service || return 1
+    elif [[ -L $WANTS && $(readlink "$WANTS") == "$UNIT" ]]; then
+        rm -f -- "$WANTS"
+    fi
+    # Stopping also cancels a pending automatic restart. Without the program
+    # ExecStop cannot run, but needs_clear has already found no rules.
+    if [[ $(systemctl show -p LoadState --value cascade.service 2>/dev/null) == loaded ]]; then
+        systemctl stop cascade.service || [[ ! -f $PROGRAM ]] || return 1
+        systemctl reset-failed cascade.service 2>/dev/null || true
+    fi
+    rm -f -- "$UNIT" /usr/local/bin/cascade "$PROGRAM" /usr/local/lib/cascade/.cascade.py.new \
+        /etc/cascade/state.json /etc/cascade/.state-* /etc/cascade/.lock
+    # Directories stay only if someone else put files there.
+    rmdir /usr/local/lib/cascade 2>/dev/null || true
+    rmdir /etc/cascade 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl reset-failed cascade.service 2>/dev/null || true
+    return 0
+}
+
+# Shared by --uninstall and by the rollback of a first installation.
+uninstall() {
+    deactivate || return 1
+    if needs_clear; then
+        if [[ ! -f $PROGRAM ]]; then
+            echo "Найдены правила Cascade, но нет $PROGRAM. Запустите установку, затем удаление." >&2
+            return 1
+        fi
+        /usr/bin/python3 -I "$PROGRAM" clear --yes --deactivate || return 1
+    fi
+    remove_files
+}
+
+# A firewall snapshot saved while Cascade was active would restore it at boot.
+warn_saved() {
+    local file
+    for file in /etc/iptables/rules.v4 /etc/iptables.rules /etc/iptables.up.rules; do
+        if [[ -f $file ]] && grep -Fq 'cascade:v2' "$file"; then
+            echo "Внимание: $file содержит правила Cascade (cascade:v2). Загрузчик firewall вернёт их после перезагрузки." >&2
+            echo 'Удалите эти строки вручную или пересохраните текущие правила (например, netfilter-persistent save).' >&2
+        fi
+    done
+    return 0
+}
+
 if [[ $ACTION == uninstall ]]; then
-    if [[ ! -f $PROGRAM ]]; then
+    installed=0
+    for path in "$PROGRAM" "$UNIT" /usr/local/bin/cascade /usr/local/lib/cascade /etc/cascade; do
+        if [[ -e $path || -L $path ]]; then installed=1; fi
+    done
+    if [[ -L $WANTS && $(readlink "$WANTS") == "$UNIT" ]]; then installed=1; fi
+    if [[ $installed == 0 ]] && ! needs_clear; then
         echo 'Cascade не установлен.'
+        warn_saved
         exit 0
     fi
-    # Keep files if removing runtime rules or stopping the unit fails.
-    /usr/bin/python3 -I "$PROGRAM" clear --yes --deactivate
-    systemctl disable --now cascade.service
-    rm -f -- "$UNIT" /usr/local/bin/cascade
-    rm -f -- "$PROGRAM" /etc/cascade/state.json
-    # Keep .lock and its directory: never unlink a lock held by another process.
-    rmdir /usr/local/lib/cascade 2>/dev/null || true
-    systemctl daemon-reload
+    if ! uninstall; then
+        echo 'Удаление не завершено; файлы сохранены, команды Cascade заблокированы. Устраните ошибку выше и повторите удаление (или установку, чтобы вернуть работу).' >&2
+        exit 1
+    fi
+    warn_saved
     echo 'Cascade удалён. Системные пакеты и чужой firewall сохранены.'
     exit 0
 fi
@@ -93,10 +173,15 @@ cat > "$scratch/cascade.service" <<'UNIT'
 Description=Cascade IPv4 TCP/UDP relay
 Wants=network-online.target
 After=network-online.target nftables.service netfilter-persistent.service ufw.service firewalld.service docker.service
+# Retry for several minutes if an address or route appears late after boot.
+StartLimitIntervalSec=10min
+StartLimitBurst=20
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+Restart=on-failure
+RestartSec=20s
 ExecStart=/usr/bin/python3 -I /usr/local/lib/cascade/cascade.py apply
 ExecReload=/usr/bin/python3 -I /usr/local/lib/cascade/cascade.py apply
 ExecStop=/usr/bin/python3 -I /usr/local/lib/cascade/cascade.py stop
@@ -128,25 +213,26 @@ rollback() {
     trap - ERR INT TERM
     set +e
     journalctl -u cascade.service -n 30 --no-pager >&2
-    if [[ $had_program == 1 ]]; then
-        install -m 0755 "$scratch/old.py" "$PROGRAM"
-    else
-        if [[ -f $PROGRAM ]] && ! /usr/bin/python3 -I "$PROGRAM" clear --yes --deactivate; then
-            echo 'Откат не смог очистить правила. Файлы сохранены; повторите удаление.' >&2
-            exit "$result"
+    if [[ $had_program == 0 ]]; then
+        # Cascade was not installed before: remove everything this run created.
+        if uninstall; then
+            echo 'Установка не завершена; созданные файлы удалены. Проверьте ошибки выше.' >&2
+        else
+            echo 'Откат не смог удалить правила Cascade. Устраните ошибку и выполните: sudo bash install.sh --uninstall' >&2
         fi
-        rm -f -- "$PROGRAM" /usr/local/bin/cascade
+        exit "$result"
     fi
-    if [[ $had_unit == 1 ]]; then
-        install -m 0644 "$scratch/old.service" "$UNIT"
-    else
-        rm -f -- "$UNIT"
-    fi
-    [[ $was_enabled == 1 ]] || systemctl disable cascade.service
+    install -m 0755 "$scratch/old.py" "$PROGRAM"
+    [[ $had_unit == 0 ]] || install -m 0644 "$scratch/old.service" "$UNIT"
     systemctl daemon-reload
-    if [[ $was_active == 1 && $had_program == 1 ]]; then
-        systemctl reload cascade.service
+    # Return the unit to its previous state while its file still exists.
+    [[ $was_active == 1 ]] || systemctl stop cascade.service
+    [[ $was_enabled == 1 ]] || systemctl disable cascade.service
+    if [[ $had_unit == 0 ]]; then
+        rm -f -- "$UNIT"
+        systemctl daemon-reload
     fi
+    [[ $was_active == 0 ]] || systemctl reload cascade.service
     echo 'Установка не завершена; предыдущие файлы восстановлены. Проверьте ошибки выше.' >&2
     exit "$result"
 }
@@ -159,7 +245,7 @@ install -m 0755 "$scratch/cascade.py" /usr/local/lib/cascade/.cascade.py.new
 mv -f -- /usr/local/lib/cascade/.cascade.py.new "$PROGRAM"
 ln -sfn -- "$PROGRAM" /usr/local/bin/cascade
 install -m 0644 "$scratch/cascade.service" "$UNIT"
-# Re-enable commands after a completed removal, without replacing the lock inode.
+# Re-enable commands after an unfinished removal, without replacing the lock inode.
 exec 8>>/etc/cascade/.lock
 flock -x 8
 : >/etc/cascade/.lock

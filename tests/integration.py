@@ -97,6 +97,12 @@ def main():
     assert os.geteuid() == 0, "Run with sudo"
     with tempfile.TemporaryDirectory(prefix="cascade-integration-") as tmp:
         state = Path(tmp)
+        # install.sh creates the lock; the manager itself never does, so a
+        # command left over after removal cannot re-enable itself.
+        bad = run("python3", "-c", relay_code(state), "list", ok=False)
+        assert bad.returncode != 0 and "не установлен" in bad.stderr, bad.stderr
+        assert not (state / ".lock").exists()
+        (state / ".lock").touch(mode=0o600)
         for name in (CLIENT, RELAY, SERVER):
             run("ip", "netns", "add", name)
             ns(name, "ip", "link", "set", "lo", "up")

@@ -8,19 +8,20 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 TAG = "cascade:v2"
 CHAINS = {"nat": ("CSCD_DNAT", "CSCD_SNAT"), "filter": ("CSCD_FWD",)}
 STATE = Path("/etc/cascade/state.json")
 FORWARD = Path("/proc/sys/net/ipv4/ip_forward")
 SAFE_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
+# Options whose value is free text and may itself look like "-j" or "-p".
+FREE_TEXT = ("--comment", "--string", "--log-prefix", "--nflog-prefix")
 
 
 class Error(Exception):
@@ -43,6 +44,14 @@ def ipv4(value):
     if address.is_unspecified or address.is_multicast or address.is_loopback or int(address) == 0xffffffff:
         raise Error("Нельзя использовать loopback, multicast, 0.0.0.0 или broadcast.")
     return str(address)
+
+
+def target_ipv4(value):
+    address = ipv4(value)
+    if ipaddress.IPv4Address(address).is_link_local:
+        raise Error("Цель не может быть link-local (169.254.0.0/16): там служебные адреса, "
+                    "например метаданные облака.")
+    return address
 
 
 def port(value):
@@ -90,6 +99,34 @@ def load():
     return validate_state(json.loads(STATE.read_text(encoding="utf-8"))) if STATE.exists() else empty_state()
 
 
+def split(line):
+    """Split one iptables-save line without ever failing on foreign rules.
+
+    iptables-save quotes values with spaces or special characters as
+    "..." and escapes only backslash and quotes inside them; other tokens are
+    printed verbatim, so a chain or ipset name may contain an apostrophe.
+    """
+    tokens, i = [], 0
+    while i < len(line):
+        if line[i].isspace():
+            i += 1
+        elif line[i] == '"':
+            value, i = [], i + 1
+            while i < len(line) and line[i] != '"':
+                if line[i] == "\\" and i + 1 < len(line):
+                    i += 1
+                value.append(line[i])
+                i += 1
+            tokens.append("".join(value))
+            i += 1
+        else:
+            start = i
+            while i < len(line) and not line[i].isspace():
+                i += 1
+            tokens.append(line[start:i])
+    return tokens
+
+
 def option(tokens, *names):
     i, negative = 0, False
     while i < len(tokens) - 1:
@@ -100,14 +137,20 @@ def option(tokens, *names):
             continue
         if token in names:
             return tokens[i + 1], negative
-        # A comment is data, even when its entire value is "-p" or "!".
-        i += 2 if token == "--comment" else 1
+        # Free text is data, even when its entire value is "-p" or "!".
+        i += 2 if token in FREE_TEXT else 1
         negative = False
     return None, False
 
 
-def tagged(line):
-    return option(shlex.split(line), "--comment")[0] == TAG
+def jumps(tokens):
+    # Every "-j X"/"-g X" pair counts: a free-text value equal to "-j" can only
+    # add a false reference, which makes ownership checks refuse, never skip.
+    return {tokens[i + 1] for i in range(len(tokens) - 1) if tokens[i] in ("-j", "-g")}
+
+
+def tagged(tokens):
+    return any(tokens[i] == "--comment" and tokens[i + 1] == TAG for i in range(len(tokens) - 1))
 
 
 def parse_save(text):
@@ -126,16 +169,16 @@ def owned(table, snapshot):
     content = {name: [] for name in names if name in snapshot["chains"]}
     hooks = []
     for line in snapshot["rules"]:
-        tokens = shlex.split(line)
+        tokens = split(line)
         source = tokens[1]
-        dest = option(tokens, "-j", "-g")[0]
+        dest = jumps(tokens) & names
         if source in names:
-            if not tagged(line):
+            if not tagged(tokens):
                 raise Error(f"Цепочка {source} содержит чужое правило; она не будет изменена.")
             content[source].append(line)
-        elif dest in names:
-            if not tagged(line):
-                raise Error(f"Обнаружена чужая ссылка на {dest}; операция остановлена.")
+        elif dest:
+            if not tagged(tokens):
+                raise Error(f"Обнаружена чужая ссылка на {', '.join(sorted(dest))}; операция остановлена.")
             hooks.append(line)
     for name, lines in content.items():
         if not lines:
@@ -277,14 +320,29 @@ def overlaps(address, listen):
         return False
 
 
-def socket_conflict(item, output):
+def socket_conflict(item, output, strict=True):
     for line in output.splitlines():
         fields = line.split()
-        if len(fields) >= 4:
-            address, sep, value = fields[3].rpartition(":")
-            if sep and value == str(item["incoming"]) and overlaps(address, item["listen"]):
-                return True
+        if len(fields) < 4:
+            continue
+        # A saved rule already owns its port; the kernel may still hand that
+        # port to an outgoing client socket, which keeps its own conntrack
+        # entry. Only receiving sockets (TCP LISTEN, unconnected UDP) conflict.
+        if not strict and fields[0] not in ("LISTEN", "UNCONN"):
+            continue
+        address, sep, value = fields[3].rpartition(":")
+        if sep and value == str(item["incoming"]) and overlaps(address, item["listen"]):
+            return True
     return False
+
+
+def host_ports(value):
+    # Docker stores a reserved host range as "8000-8010"; "" means random.
+    match = re.fullmatch(r"([0-9]{1,5})(?:-([0-9]{1,5}))?", value or "")
+    if not match:
+        return None
+    low, high = int(match[1]), int(match[2] or match[1])
+    return (low, high) if 1 <= low <= high <= 65535 else None
 
 
 def docker_bindings():
@@ -301,14 +359,15 @@ def docker_bindings():
         for mapping in (container.get("HostConfig", {}).get("PortBindings"), container.get("NetworkSettings", {}).get("Ports")):
             for name, entries in (mapping or {}).items():
                 for entry in entries or []:
-                    if entry.get("HostPort", "").isdigit():
-                        bindings.append((name.rsplit("/", 1)[-1], entry.get("HostIp", ""), int(entry["HostPort"]), container.get("Name", "container")))
+                    ports = host_ports(entry.get("HostPort"))
+                    if ports:
+                        bindings.append((name.rsplit("/", 1)[-1], entry.get("HostIp", ""), *ports, container.get("Name", "container")))
     return bindings
 
 
 def nat_conflict(item, line):
-    tokens = shlex.split(line)
-    if tokens[1] in CHAINS["nat"] or option(tokens, "-j")[0] not in ("DNAT", "REDIRECT"):
+    tokens = split(line)
+    if tokens[1] in CHAINS["nat"] or not jumps(tokens) & {"DNAT", "REDIRECT"}:
         return False
     proto, negative = option(tokens, "-p", "--protocol")
     match = proto in (None, "all", "0", item["proto"], "6" if item["proto"] == "tcp" else "17")
@@ -336,7 +395,12 @@ def nat_conflict(item, line):
     return match != negative
 
 
-def check_ports(rules, snapshot):
+def check_ports(rules, snapshot, strict=()):
+    """Refuse endpoints that belong to local services, Docker or foreign NAT.
+
+    strict holds keys of new endpoints: any socket on their port counts.
+    Saved endpoints ignore outgoing client sockets (see socket_conflict).
+    """
     if not rules:
         return
     addresses = local_addresses()
@@ -350,10 +414,10 @@ def check_ports(rules, snapshot):
             raise Error("Локальный IPv4 не назначен этому серверу: " + item["listen"])
         if item["target"] in addresses:
             raise Error("Назначение находится на этом же VPS; нужен удалённый сервер.")
-        for proto, address, value, name in bindings:
-            if proto == item["proto"] and value == item["incoming"] and overlaps(address, item["listen"]):
+        for proto, address, low, high, name in bindings:
+            if proto == item["proto"] and low <= item["incoming"] <= high and overlaps(address, item["listen"]):
                 raise Error(endpoint + f" зарезервирован Docker-контейнером {name}. Выберите другой входящий порт.")
-        if socket_conflict(item, sockets[item["proto"]]):
+        if socket_conflict(item, sockets[item["proto"]], key(item) in strict):
             raise Error(endpoint + " занят локальным сервисом (возможно SSH/VPN). Выберите другой входящий порт.")
         if any(nat_conflict(item, line) for line in snapshot["nat"]["rules"]):
             raise Error(endpoint + " занят другим DNAT/REDIRECT. Выберите другой входящий порт.")
@@ -368,7 +432,7 @@ def purge(item):
 
 
 def stage(state):
-    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    # The directory exists: callers hold its lock, created by install.sh.
     fd, name = tempfile.mkstemp(prefix=".state-", dir=STATE.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -389,16 +453,18 @@ def transition(old, new, *, save=True, check=True):
     backup = {t: owned(t, snapshot[t]) for t in CHAINS}
     if new["rules"] and check:
         fw.preflight()
-        check_ports(new["rules"], snapshot)
+        fresh = {key(r) for r in new["rules"] if r not in old["rules"]}
+        check_ports(new["rules"], snapshot, strict=fresh)
     targets = {t: desired(t, new["rules"], snapshot[t]) for t in CHAINS}
     new["backend"] = fw.backend if new["rules"] else None
     validate_state(new)
     pending = stage(new) if save else None
-    changed = False
+    changed = enabled = False
     try:
         fw.apply(targets, test=True)
         if new["rules"] and FORWARD.read_text().strip() != "1":
             FORWARD.write_text("1\n")
+            enabled = True
         changed = True
         fw.apply(targets)
         # Keep the saved rules available for retry if conntrack cleanup fails.
@@ -424,14 +490,23 @@ def transition(old, new, *, save=True, check=True):
     finally:
         if pending:
             pending.unlink(missing_ok=True)
-    # Forwarding is shared with Docker/VPNs. Never disable it, even on rollback.
+    # Forwarding is shared with Docker/VPNs. Never disable it, even on rollback,
+    # and never change the FORWARD policy; only make the consequence visible.
+    if enabled and snapshot["filter"]["chains"].get("FORWARD") != "DROP":
+        print("Внимание: включён net.ipv4.ip_forward, а политика FORWARD не DROP. Сервер будет "
+              "пересылать и другой транзитный трафик, который на него направят. Если это не нужно, "
+              "ограничьте FORWARD своим firewall: разрешения Cascade стоят раньше политики.", file=sys.stderr)
 
 
 @contextlib.contextmanager
 def locked(*, allow_disabled=False):
     import fcntl
-    STATE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(STATE.parent / ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    # Only install.sh creates the lock. A command started after removal must
+    # fail here instead of recreating /etc/cascade and an unblocked lock.
+    try:
+        fd = os.open(STATE.parent / ".lock", os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise Error("Cascade не установлен. Для установки запустите install.sh.") from exc
     with os.fdopen(fd, "r+", encoding="utf-8") as lock:
         os.fchmod(lock.fileno(), 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -473,7 +548,7 @@ def execute(args):
         elif args.command == "add":
             incoming = port(args.in_port)
             outgoing = port(args.out_port) if args.out_port is not None else incoming
-            target = ipv4(args.target)
+            target = target_ipv4(args.target)
             listen = args.listen or detect_listen(target)
             item = rule(args.proto, listen, incoming, target, outgoing)
             existing = next((r for r in old["rules"] if key(r) == key(item)), None)
@@ -520,6 +595,15 @@ def parser():
     return root
 
 
+def remove_rule(item):
+    # The menu asks for a number without holding the lock; re-check the rule.
+    with locked():
+        old = load()
+        if item not in old["rules"]:
+            raise Error("Список правил изменился. Повторите выбор.")
+        transition(old, dict(old, rules=[r for r in old["rules"] if r != item]), check=False)
+
+
 def ask(label, validate):
     while True:
         value = input(label).strip()
@@ -543,7 +627,7 @@ def menu():
                 proto = input("Протокол tcp/udp: ").strip() if choice == "4" else "udp" if choice == "1" else "tcp"
                 if proto not in ("tcp", "udp"):
                     raise Error("Введите tcp или udp.")
-                target = ask("IPv4 назначения: ", route_to)
+                target = ask("IPv4 назначения: ", lambda value: route_to(target_ipv4(value)))
                 def validate_listen(value):
                     address = ipv4(value or detect_listen(target))
                     if address not in local_addresses():
@@ -555,7 +639,7 @@ def menu():
                         state = load()
                         if any(key(r) == key(item) for r in state["rules"]):
                             raise Error("Этот входящий порт уже используется Cascade.")
-                        check_ports([item], Firewall(state["backend"]).snapshot())
+                        check_ports([item], Firewall(state["backend"]).snapshot(), strict={key(item)})
                 incoming = ask("Входящий порт: ", validate_incoming)
                 outgoing = ask("Порт назначения (Enter — как входящий): ", lambda value: port(value or incoming)) or incoming
                 execute(parser().parse_args(["add", "--proto", proto, "--target", target, "--listen", listen,
@@ -563,20 +647,20 @@ def menu():
             elif choice == "5":
                 execute(parser().parse_args(["status"]))
             elif choice == "6":
+                # Never wait for input while holding the lock: an open menu
+                # would block removal, reinstall and systemd indefinitely.
                 with locked():
                     state = load()
-                    display(state)
-                    if not state["rules"]:
-                        continue
-                    value = input("Номер правила (0 — отмена): ").strip()
-                    if value == "0":
-                        continue
-                    if not value.isdecimal() or not 1 <= int(value) <= len(state["rules"]):
-                        raise Error("Неверный номер правила.")
-                    new = copy.deepcopy(state)
-                    del new["rules"][int(value) - 1]
-                    transition(state, new, check=False)
-                    print("Готово.")
+                display(state)
+                if not state["rules"]:
+                    continue
+                value = input("Номер правила (0 — отмена): ").strip()
+                if value == "0":
+                    continue
+                if not value.isdecimal() or not 1 <= int(value) <= len(state["rules"]):
+                    raise Error("Неверный номер правила.")
+                remove_rule(state["rules"][int(value) - 1])
+                print("Готово.")
             elif choice == "7" and input("Удалить только правила Cascade? [yes]: ") == "yes":
                 execute(parser().parse_args(["clear", "--yes"]))
             elif choice == "8":
@@ -596,7 +680,9 @@ def main():
     os.environ["PATH"] = SAFE_PATH
     def interrupted(signum, _frame):
         raise Error(f"Операция прервана сигналом {signum}.")
-    signal.signal(signal.SIGTERM, interrupted)
+    # A dropped SSH session sends SIGHUP: roll back like on SIGTERM.
+    for signum in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, interrupted)
     if args.command in (None, "menu"):
         if not sys.stdin.isatty():
             raise Error("Для меню нужен терминал; для автоматизации используйте cascade --help.")

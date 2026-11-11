@@ -2,6 +2,7 @@ import copy
 import contextlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -43,6 +44,11 @@ class Validation(unittest.TestCase):
         with self.assertRaises(c.Error):
             c.validate_state(dict(version=2, backend="nft", rules=[ITEM, ITEM]))
 
+    def test_link_local_target_refused(self):
+        with self.assertRaisesRegex(c.Error, "link-local"):
+            c.target_ipv4("169.254.169.254")
+        self.assertEqual(c.target_ipv4("10.2.0.2"), "10.2.0.2")
+
     def test_unknown_options_refused(self):
         with patch("sys.stderr"):
             with self.assertRaises(SystemExit):
@@ -56,6 +62,19 @@ class PortProtection(unittest.TestCase):
         self.assertFalse(c.socket_conflict(ITEM, "LISTEN 0 4096 10.1.0.9:8443 0.0.0.0:*"))
         self.assertFalse(c.socket_conflict(ITEM, "LISTEN 0 4096 0.0.0.0:8444 0.0.0.0:*"))
         self.assertTrue(c.socket_conflict(ITEM, "ESTAB 0 0 10.1.0.1:8443 10.1.0.4:22"))
+
+    def test_saved_rule_ignores_outgoing_client_sockets(self):
+        for line in ("ESTAB 0 0 10.1.0.1:8443 9.9.9.9:443", "TIME-WAIT 0 0 10.1.0.1:8443 9.9.9.9:443"):
+            self.assertTrue(c.socket_conflict(ITEM, line, strict=True))
+            self.assertFalse(c.socket_conflict(ITEM, line, strict=False))
+        for line in ("LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*", "UNCONN 0 0 10.1.0.1:8443 0.0.0.0:*"):
+            self.assertTrue(c.socket_conflict(ITEM, line, strict=False))
+
+    def test_docker_host_port_ranges(self):
+        self.assertEqual(c.host_ports("8443"), (8443, 8443))
+        self.assertEqual(c.host_ports("8000-8010"), (8000, 8010))
+        for value in ("", None, "0", "70000", "9-1", "a"):
+            self.assertIsNone(c.host_ports(value))
 
     def test_nat_ranges_redirect_and_negation(self):
         for line in (
@@ -85,14 +104,35 @@ class PortProtection(unittest.TestCase):
         with self.assertRaisesRegex(c.Error, "чужая ссылка"):
             c.owned("filter", snapshot)
 
+    def test_free_text_values_cannot_hide_a_jump_or_protocol(self):
+        snapshot = c.parse_save(':CSCD_FWD - [0:0]\n-A CSCD_FWD -m comment --comment "cascade:v2"\n'
+                                '-A FORWARD -m string --string "-j" --algo bm -j CSCD_FWD')
+        with self.assertRaisesRegex(c.Error, "чужая ссылка"):
+            c.owned("filter", snapshot)
+        line = '-A PREROUTING -m string --string "-p" --algo bm -p tcp --dport 8443 -j DNAT --to-destination 10.4.0.1'
+        self.assertTrue(c.nat_conflict(ITEM, line))
+
+    def test_foreign_names_with_quotes_do_not_break_parsing(self):
+        # shlex.split() failed on these lines and blocked even removal.
+        text = (":FORWARD ACCEPT [0:0]\n:it's - [0:0]\n:CSCD_FWD - [0:0]\n-A FORWARD -j it's\n"
+                "-A FORWARD -m set --match-set o'set src -j ACCEPT\n"
+                '-A FORWARD -m comment --comment "cascade:v2" -j CSCD_FWD\n'
+                '-A CSCD_FWD -m comment --comment "cascade:v2"\n')
+        result = c.owned("filter", c.parse_save(text))
+        self.assertEqual(len(result["hooks"]), 1)
+        self.assertFalse(c.nat_conflict(ITEM, "-A PREROUTING -p tcp --dport 8443 -j it's"))
+        self.assertEqual(c.split(r'-A X -m comment --comment "a \"b\" \\ c" -j Y'),
+                         ["-A", "X", "-m", "comment", "--comment", 'a "b" \\ c', "-j", "Y"])
+
     @patch.object(c, "local_addresses", return_value={"10.1.0.1"})
     @patch.object(c, "route_to", return_value={"dev": "eth0"})
     @patch.object(c, "run", return_value=subprocess.CompletedProcess([], 0, "", ""))
     def test_docker_binding_without_listener(self, *_):
-        with patch.object(c, "docker_bindings", return_value=[("tcp", "0.0.0.0", 8443, "amnezia")]):
-            with self.assertRaisesRegex(c.Error, "Docker"):
-                c.check_ports([ITEM], EMPTY)
-        with patch.object(c, "docker_bindings", return_value=[("udp", "0.0.0.0", 8443, "amnezia")]):
+        for binding in (("tcp", "0.0.0.0", 8443, 8443, "amnezia"), ("tcp", "", 8400, 8500, "range")):
+            with patch.object(c, "docker_bindings", return_value=[binding]):
+                with self.assertRaisesRegex(c.Error, "Docker"):
+                    c.check_ports([ITEM], EMPTY)
+        with patch.object(c, "docker_bindings", return_value=[("udp", "0.0.0.0", 8443, 8443, "amnezia")]):
             c.check_ports([ITEM], EMPTY)
 
     def test_docker_failure_does_not_skip_port_check(self):
@@ -127,6 +167,65 @@ class Menu(unittest.TestCase):
             c.menu()
         args = execute.call_args.args[0]
         self.assertEqual((args.listen, args.in_port, args.out_port), ("10.1.0.1", "8443", "8443"))
+
+    def test_rule_number_is_read_without_holding_the_lock(self):
+        held = []
+
+        @contextlib.contextmanager
+        def lock(**_):
+            held.append(True)
+            try:
+                yield None
+            finally:
+                held.pop()
+
+        answers = iter(["6", "1", "0"])
+
+        def answer(prompt):
+            self.assertFalse(held, f"input() under lock: {prompt}")
+            return next(answers)
+
+        state = dict(version=2, backend="nft", rules=[ITEM])
+        with patch("builtins.input", side_effect=answer), patch("builtins.print"), \
+                patch.object(c, "locked", lock), patch.object(c, "load", side_effect=lambda: copy.deepcopy(state)), \
+                patch.object(c, "transition") as transition:
+            c.menu()
+        old, new = transition.call_args.args
+        self.assertEqual((old["rules"], new["rules"]), ([ITEM], []))
+
+    def test_rule_changed_while_menu_was_waiting(self):
+        with patch.object(c, "locked", side_effect=lambda: contextlib.nullcontext()), \
+                patch.object(c, "load", return_value=c.empty_state()), patch.object(c, "transition") as transition:
+            with self.assertRaisesRegex(c.Error, "изменился"):
+                c.remove_rule(ITEM)
+        transition.assert_not_called()
+
+
+@unittest.skipUnless(hasattr(os, "O_NOFOLLOW") and os.name == "posix", "flock is POSIX-only")
+class Lock(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name) / "cascade"
+        p = patch.object(c, "STATE", self.base / "state.json")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_missing_lock_is_never_recreated(self):
+        # After removal a stale process must not recreate an unblocked lock.
+        with self.assertRaisesRegex(c.Error, "не установлен"):
+            with c.locked():
+                pass
+        self.assertFalse(self.base.exists())
+
+    def test_disabled_lock_blocks_all_but_cleanup(self):
+        self.base.mkdir()
+        (self.base / ".lock").write_text("disabled\n")
+        with self.assertRaisesRegex(c.Error, "удаляется"):
+            with c.locked():
+                pass
+        with c.locked(allow_disabled=True):
+            pass
 
 
 class ScopedFirewall(unittest.TestCase):
@@ -225,6 +324,23 @@ class Transactions(unittest.TestCase):
     def test_empty_apply_does_not_pin_backend(self):
         c.transition(self.old, self.old)
         self.assertIsNone(c.load()["backend"])
+
+    def test_open_forward_policy_is_reported_not_changed(self):
+        with patch("sys.stderr") as stderr:
+            c.transition(self.old, self.new)
+        self.assertFalse(stderr.write.called)  # FORWARD DROP in the fixture
+        self.forward.write_text("0\n")
+        self.fw.snapshot.return_value["filter"]["chains"]["FORWARD"] = "ACCEPT"
+        with patch("sys.stderr") as stderr:
+            c.transition(c.load(), dict(self.new, rules=[ITEM, dict(ITEM, incoming=8444)]))
+        self.assertIn("FORWARD", "".join(call.args[0] for call in stderr.write.call_args_list))
+        self.assertFalse(any("-P FORWARD" in str(call) for call in self.fw.apply.call_args_list))
+
+    def test_only_new_endpoints_get_the_strict_socket_check(self):
+        c.transition(self.old, self.new)
+        self.assertEqual(self.check_ports.call_args.kwargs["strict"], {c.key(ITEM)})
+        c.transition(self.new, self.new)
+        self.assertEqual(self.check_ports.call_args.kwargs["strict"], set())
 
     def test_apply_expires_only_local_attempts_before_dnat(self):
         c.transition(self.new, self.new)
