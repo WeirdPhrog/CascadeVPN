@@ -127,8 +127,10 @@ curl -fsSL --retry 3 -o "$scratch/old.py" \
     https://raw.githubusercontent.com/WeirdPhrog/Cascade/309ab3d451fa2499ca5460b8d75bab96814e1c9d/cascade.py
 echo "def02d8acf7d06b13a9f42e46876c4899657899fdb4083f9d9b9f217f6bd12c8  $scratch/old.py" | sha256sum --check --status
 sudo bash install.sh --no-menu
-menu='^python3 -I /usr/local/lib/cascade/cascade.py menu$'
-sleep 60 | sudo script -qfec 'python3 -I /usr/local/lib/cascade/cascade.py menu' /dev/null >/dev/null 2>&1 &
+# Started by a relative path from the install directory, so only the
+# process's working directory identifies it.
+menu='^python3 -I \./cascade\.py menu$'
+sleep 60 | sudo script -qfec 'cd /usr/local/lib/cascade && exec python3 -I ./cascade.py menu' /dev/null >/dev/null 2>&1 &
 menu_job=$!
 for _ in $(seq 1 50); do
     if pgrep -f "$menu" >/dev/null; then break; fi

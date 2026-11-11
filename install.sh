@@ -12,6 +12,10 @@ CONFIG=/etc/cascade
 UNIT=/etc/systemd/system/cascade.service
 WANTS=/etc/systemd/system/multi-user.target.wants/cascade.service
 PYTHON=/usr/bin/python3
+# Kernel views used by the removal helpers (replaced by tests/install-functions.sh).
+PROC=/proc
+PROC_UID=0
+LEGACY_TABLES=/proc/net/ip_tables_names
 NO_MENU=0
 ACTION=install
 case "${1:-}" in
@@ -59,7 +63,7 @@ fi
 
 # Returns 0 if Cascade rules exist, 1 if there are none, 2 if unknown.
 rules_present() {
-    local save output status=0 result=1 checked=0
+    local save output status=0 result=1
     if [[ -e $CONFIG/state.json ]]; then
         "$PYTHON" -I -c 'import json, sys
 sys.exit(3 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' "$CONFIG/state.json" 2>/dev/null || status=$?
@@ -71,34 +75,44 @@ sys.exit(3 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' "
         fi
     fi
     # Both variants: rules may remain in the one that is no longer selected.
-    # A variant whose tools are not installed cannot have received rules.
+    # A missing tool proves nothing (it may be removed after rules were
+    # applied), except that the kernel lists no legacy tables at all.
     for save in iptables-nft-save iptables-legacy-save; do
-        command -v "$save" >/dev/null || continue
-        checked=1
-        if ! output=$("$save" 2>&1); then
+        if ! command -v "$save" >/dev/null; then
+            if [[ $save == iptables-legacy-save && -z $(cat -- "$LEGACY_TABLES" 2>/dev/null) ]]; then
+                continue
+            fi
+            echo "Нет $save: правила этого варианта iptables проверить нельзя." \
+                'Установите пакет iptables и повторите.' >&2
+            result=2
+        elif ! output=$("$save" 2>&1); then
             echo "Не удалось проверить firewall командой $save: ${output%%$'\n'*}" >&2
             result=2
         elif [[ $output == *cascade:v2* ]]; then
             return 0
         fi
     done
-    if [[ $checked == 0 ]]; then
-        echo 'Нет iptables-nft-save и iptables-legacy-save: проверить firewall нельзя.' >&2
-        result=2
-    fi
     return "$result"
 }
 
 # PIDs of running Cascade managers (open menus or commands), one per line.
+# A false match only keeps the lock file, so matching is deliberately broad:
+# any root Python process with an argument named cascade.py (an installed
+# file, a copy or a clone), or with a path that resolves to the program or
+# the command, also relative to the process's working directory.
 cascade_processes() {
-    local dir arg args
-    for dir in /proc/[0-9]*; do
-        [[ $(stat -c %u "$dir" 2>/dev/null) == 0 ]] || continue
+    local dir arg args cwd path
+    for dir in "$PROC"/[0-9]*; do
+        [[ $(stat -c %u "$dir" 2>/dev/null) == "$PROC_UID" ]] || continue
         mapfile -d '' -t args 2>/dev/null <"$dir/cmdline" || continue
-        [[ ${#args[@]} -gt 1 && ${args[0]##*/} == python3* ]] || continue
+        [[ ${#args[@]} -gt 1 && ${args[0]##*/} == python* ]] || continue
+        cwd=$(readlink -- "$dir/cwd" 2>/dev/null) || cwd=/
+        cwd=${cwd% (deleted)}
         for arg in "${args[@]:1}"; do
-            if [[ $arg == "$PROGRAM" || $arg == "$COMMAND" ]]; then
-                echo "${dir#/proc/}"
+            if [[ $arg == /* ]]; then path=$arg; else path=$cwd/$arg; fi
+            path=$(realpath -m -- "$path" 2>/dev/null) || path=
+            if [[ ${arg##*/} == cascade.py || $path == "$PROGRAM" || $path == "$COMMAND" ]]; then
+                echo "${dir##*/}"
                 break
             fi
         done

@@ -14,8 +14,11 @@ declare -F rules_present cascade_processes deactivate remove_files uninstall >/d
 {
     LIBDIR=$work/lib PROGRAM=$work/lib/cascade.py COMMAND=$work/bin/cascade CONFIG=$work/etc
     UNIT=$work/unit/cascade.service WANTS=$work/wants/cascade.service PYTHON=fake_python
+    PROC=$work/proc PROC_UID=$(id -u) LEGACY_TABLES=$work/ip_tables_names
 }
 calls=$work/calls
+# Keep the real process scan for the /proc model below, then stub it.
+eval "real_$(declare -f cascade_processes)"
 
 # Stubs. Each variant of iptables-save prints $work/<variant>.out and exits
 # with the status in $work/<variant>.status.
@@ -50,7 +53,7 @@ rm() {  # fails only when removing the path written to $work/rm.fails
 
 reset() {
     command rm -rf -- "$work/lib" "$work/bin" "$work/etc" "$work/unit" "$work/processes" \
-        "$work/rm.fails" "$work/reload.fails"
+        "$work/rm.fails" "$work/reload.fails" "$LEGACY_TABLES" "$PROC"
     : >"$calls"
     : >"$work/nft.out"
     : >"$work/legacy.out"
@@ -91,10 +94,50 @@ echo '{"version": 2, "rules": [{"proto": "tcp"}], "backend": "nft"}' >"$CONFIG/s
 expect 0 rules_present
 echo '{broken' >"$CONFIG/state.json"
 expect 2 rules_present
+# A missing iptables-save proves nothing, except for legacy rules when the
+# kernel lists no legacy tables. Real binaries live in /usr/sbin, so a PATH
+# without it hides them while keeping coreutils.
 reset
-# No iptables-save at all: hide the stubs and any real binaries.
-# shellcheck disable=SC2123
-(unset -f iptables-nft-save iptables-legacy-save; PATH=/nonexistent; expect 2 rules_present)
+(unset -f iptables-nft-save; PATH=/usr/bin:/bin; expect 2 rules_present)
+(unset -f iptables-legacy-save; PATH=/usr/bin:/bin; expect 1 rules_present)
+echo filter >"$LEGACY_TABLES"
+(unset -f iptables-legacy-save; PATH=/usr/bin:/bin; expect 2 rules_present)
+command rm -f -- "$LEGACY_TABLES"
+(unset -f iptables-nft-save iptables-legacy-save; PATH=/usr/bin:/bin; expect 2 rules_present)
+
+# Every way to start a Cascade manager is found in a model of /proc.
+reset
+proc_entry() {  # pid cwd argv...
+    local pid=$1 cwd=$2
+    shift 2
+    mkdir -p "$PROC/$pid"
+    printf '%s\0' "$@" >"$PROC/$pid/cmdline"
+    ln -s -- "$cwd" "$PROC/$pid/cwd"
+}
+mkdir -p "$LIBDIR" "${COMMAND%/*}"
+proc_entry 101 "$LIBDIR" python3 -I ./cascade.py menu  # relative, from the install dir
+proc_entry 102 / /usr/bin/python3 -I "$COMMAND"         # the cascade command
+proc_entry 103 / python3 /root/Cascade/cascade.py menu  # a clone or copy
+proc_entry 104 "${COMMAND%/*}" python3.11 -I ./cascade  # relative command path
+proc_entry 105 "$LIBDIR" python3 -I ../lib/cascade.py
+proc_entry 106 / /usr/bin/python "$COMMAND" menu        # python-is-python3
+proc_entry 201 / python3 -I /srv/other.py               # unrelated programs
+proc_entry 202 "$LIBDIR" bash ./cascade.py
+proc_entry 203 / python3
+expected='101 102 103 104 105 106 '
+if [[ ! -L $PROC/104/cwd ]]; then  # e.g. Git Bash without symlink rights; CI runs on Linux
+    echo 'SKIP: no symlinks here, relative command path not checked' >&2
+    expected='101 102 103 105 106 '
+fi
+found=$(real_cascade_processes | sort | tr '\n' ' ')
+[[ $found == "$expected" ]] || fail "process scan found '$found', expected '$expected'"
+
+# Partial installation without program and configuration: a missing nft
+# tool must not let removal claim success.
+installed
+command rm -- "$PROGRAM" "$CONFIG/state.json"
+(unset -f iptables-nft-save; PATH=/usr/bin:/bin; expect 1 uninstall)
+[[ -e $UNIT && -e $COMMAND ]] || fail 'missing nft tool: files were removed'
 
 # A clean installation is removed completely.
 installed
