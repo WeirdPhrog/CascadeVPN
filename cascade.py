@@ -14,7 +14,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 TAG = "cascade:v2"
 CHAINS = {"nat": ("CSCD_DNAT", "CSCD_SNAT"), "filter": ("CSCD_FWD",)}
 STATE = Path("/etc/cascade/state.json")
@@ -26,6 +26,10 @@ FREE_TEXT = ("--comment", "--string", "--log-prefix", "--nflog-prefix")
 
 class Error(Exception):
     pass
+
+
+class Interrupted(Error):
+    """SIGTERM/SIGHUP: rolls back like any error, but also ends the menu."""
 
 
 def run(args, *, data=None, ok=(0,)):
@@ -325,10 +329,11 @@ def socket_conflict(item, output, strict=True):
         fields = line.split()
         if len(fields) < 4:
             continue
-        # A saved rule already owns its port; the kernel may still hand that
-        # port to an outgoing client socket, which keeps its own conntrack
-        # entry. Only receiving sockets (TCP LISTEN, unconnected UDP) conflict.
-        if not strict and fields[0] not in ("LISTEN", "UNCONN"):
+        # A saved TCP rule already owns its port; the kernel may still hand
+        # that port to an outgoing connection, which keeps its own conntrack
+        # entry, and only a LISTEN socket accepts new TCP connections. UDP
+        # stays strict: a service may connect() a socket and keep receiving.
+        if not strict and item["proto"] == "tcp" and fields[0] != "LISTEN":
             continue
         address, sep, value = fields[3].rpartition(":")
         if sep and value == str(item["incoming"]) and overlaps(address, item["listen"]):
@@ -610,6 +615,8 @@ def ask(label, validate):
         try:
             validate(value)
             return value
+        except Interrupted:
+            raise
         except Error as exc:
             print("Ошибка: " + str(exc))
 
@@ -668,6 +675,8 @@ def menu():
                       "VPS и входящий порт. Ключи, UUID и TLS/SNI остаются от конечного VPN. "
                       "Другие сервисы должны использовать другие входящие порты. "
                       "Документация: https://github.com/WeirdPhrog/Cascade")
+        except Interrupted:
+            raise
         except (Error, OSError, ValueError, subprocess.SubprocessError) as exc:
             print(f"Ошибка: {exc}", file=sys.stderr)
 
@@ -679,7 +688,7 @@ def main():
     os.umask(0o077)
     os.environ["PATH"] = SAFE_PATH
     def interrupted(signum, _frame):
-        raise Error(f"Операция прервана сигналом {signum}.")
+        raise Interrupted(f"Операция прервана сигналом {signum}.")
     # A dropped SSH session sends SIGHUP: roll back like on SIGTERM.
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, interrupted)

@@ -217,6 +217,45 @@ def main():
         assert not remaining.strip(), remaining
         connect("tcp", 4202)
         connect("udp", 4201)
+        # Saved TCP rules ignore outgoing connections that reuse their port.
+        # New rules and UDP stay strict: a connected UDP socket may receive.
+        peer = subprocess.Popen(["ip", "netns", "exec", CLIENT, "python3", "-c",
+                                 "import socket,time\ns=socket.socket(); s.bind(('10.200.1.2',6000)); s.listen()\n"
+                                 "kept=[s.accept() for _ in range(2)]\ntime.sleep(300)"])
+        PROCESSES.append(peer)
+        for _ in range(50):
+            if "10.200.1.2:6000" in ns(CLIENT, "ss", "-Hlnt").stdout:
+                break
+            time.sleep(0.05)
+        tcp_holder = subprocess.Popen(["ip", "netns", "exec", RELAY, "python3", "-c",
+                                       "import socket,sys,time\nkept=[]\nfor port in (4202, 4208):\n"
+                                       "    s=socket.socket(); s.bind(('10.200.1.1',port)); s.connect(('10.200.1.2',6000)); kept.append(s)\n"
+                                       "time.sleep(300)"])
+        udp_holder = subprocess.Popen(["ip", "netns", "exec", RELAY, "python3", "-c",
+                                       "import socket,time\nu=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)\n"
+                                       "u.bind(('10.200.1.1',4201)); u.connect(('10.200.1.2',6001))\ntime.sleep(300)"])
+        PROCESSES.extend([tcp_holder, udp_holder])
+        for _ in range(50):
+            tcp, udp = ns(RELAY, "ss", "-Hant").stdout, ns(RELAY, "ss", "-Hanu").stdout
+            if "10.200.1.1:4202" in tcp and "10.200.1.1:4208" in tcp and "10.200.1.1:4201" in udp:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("Client sockets did not appear")
+        firewall = snapshot()
+        bad = command("apply", ok=False)
+        assert bad.returncode != 0 and "4201/udp занят локальным" in bad.stderr, bad.stderr
+        assert snapshot() == firewall
+        udp_holder.terminate()
+        udp_holder.wait(timeout=5)
+        command("apply")  # the outgoing TCP connection on 4202 is not a conflict
+        connect("tcp", 4202)
+        bad = command("add", "--proto", "tcp", "--listen", "10.200.1.1", "--in-port", "4208",
+                      "--target", "10.200.2.2", "--out-port", "5201", ok=False)
+        assert bad.returncode != 0 and "занят локальным" in bad.stderr, bad.stderr
+        for p in (tcp_holder, peer):
+            p.terminate()
+            p.wait(timeout=5)
         add("tcp", 4203)
         connect("tcp", 4203)
         command("delete", "--proto", "tcp", "--listen", "10.200.1.1", "--in-port", "4203")

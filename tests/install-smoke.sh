@@ -121,6 +121,32 @@ sudo bash install.sh --no-menu
 sudo ip netns exec "$namespace" cascade add --proto udp --listen 198.18.0.1 --in-port 45000 --target 198.18.0.2
 sudo ip netns exec "$namespace" bash install.sh --uninstall
 assert_removed
+# A menu left open during removal may still run the previous release, which
+# recreates a missing lock. The lock stays marked until the menu is closed.
+curl -fsSL --retry 3 -o "$scratch/old.py" \
+    https://raw.githubusercontent.com/WeirdPhrog/Cascade/309ab3d451fa2499ca5460b8d75bab96814e1c9d/cascade.py
+echo "def02d8acf7d06b13a9f42e46876c4899657899fdb4083f9d9b9f217f6bd12c8  $scratch/old.py" | sha256sum --check --status
+sudo bash install.sh --no-menu
+menu='^python3 -I /usr/local/lib/cascade/cascade.py menu$'
+sleep 60 | sudo script -qfec 'python3 -I /usr/local/lib/cascade/cascade.py menu' /dev/null >/dev/null 2>&1 &
+menu_job=$!
+for _ in $(seq 1 50); do
+    if pgrep -f "$menu" >/dev/null; then break; fi
+    sleep 0.1
+done
+pgrep -f "$menu" >/dev/null
+sudo bash install.sh --uninstall
+[[ ! -e /usr/local/lib/cascade && ! -e /etc/systemd/system/cascade.service ]]
+sudo grep -qx disabled /etc/cascade/.lock
+if sudo ip netns exec "$namespace" python3 -I "$scratch/old.py" add --proto udp --listen 198.18.0.1 \
+    --in-port 45002 --target 198.18.0.2 2>"$scratch/old.err"; then
+    echo 'Release 2.0.1 kept working after removal' >&2; exit 1
+fi
+grep -q 'удаляется' "$scratch/old.err"
+sudo pkill -f "$menu"
+wait "$menu_job" || true
+sudo bash install.sh --uninstall
+assert_removed
 # A partially removed installation (program deleted by hand) is cleaned up too.
 sudo bash install.sh --no-menu
 sudo rm /usr/local/lib/cascade/cascade.py

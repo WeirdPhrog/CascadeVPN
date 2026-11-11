@@ -4,10 +4,14 @@ set -Eeuo pipefail
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 umask 077
 REPO=https://raw.githubusercontent.com/WeirdPhrog/Cascade/main
-EXPECTED_SHA256=81877cf5f4576074d30c4f74fe52a17548b3dabcf7e948c27c4b5c605bc0182c
-PROGRAM=/usr/local/lib/cascade/cascade.py
+EXPECTED_SHA256=11c550109fe70fc96de1e8d26f4e30c77d3b260805ae3cebea75647d5636ecf3
+LIBDIR=/usr/local/lib/cascade
+PROGRAM=$LIBDIR/cascade.py
+COMMAND=/usr/local/bin/cascade
+CONFIG=/etc/cascade
 UNIT=/etc/systemd/system/cascade.service
 WANTS=/etc/systemd/system/multi-user.target.wants/cascade.service
+PYTHON=/usr/bin/python3
 NO_MENU=0
 ACTION=install
 case "${1:-}" in
@@ -49,75 +53,153 @@ if [[ -e $PROGRAM ]] && ! grep -Fxq '"""IPv4 relay: only tagged Cascade chains a
     echo "Файл $PROGRAM не принадлежит Cascade." >&2; exit 1
 fi
 
-# Saved rules or tagged firewall entries can only be removed by the manager.
-needs_clear() {
-    local save output
-    if [[ -e /etc/cascade/state.json ]] && ! /usr/bin/python3 -I -c \
-        'import json, sys; sys.exit(1 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' \
-        /etc/cascade/state.json 2>/dev/null; then
-        return 0
+# BEGIN REMOVAL HELPERS (tests/install-functions.sh runs them with stub commands)
+# Every helper reports failure through its status: callers use them in
+# conditions, where set -e does not apply.
+
+# Returns 0 if Cascade rules exist, 1 if there are none, 2 if unknown.
+rules_present() {
+    local save output status=0 result=1 checked=0
+    if [[ -e $CONFIG/state.json ]]; then
+        "$PYTHON" -I -c 'import json, sys
+sys.exit(3 if json.load(open(sys.argv[1], encoding="utf-8"))["rules"] else 0)' "$CONFIG/state.json" 2>/dev/null || status=$?
+        if [[ $status == 3 ]]; then
+            return 0
+        elif [[ $status != 0 ]]; then
+            echo "Не удалось прочитать $CONFIG/state.json." >&2
+            result=2
+        fi
     fi
+    # Both variants: rules may remain in the one that is no longer selected.
+    # A variant whose tools are not installed cannot have received rules.
     for save in iptables-nft-save iptables-legacy-save; do
-        if command -v "$save" >/dev/null && output=$("$save" 2>/dev/null) && [[ $output == *cascade:v2* ]]; then
+        command -v "$save" >/dev/null || continue
+        checked=1
+        if ! output=$("$save" 2>&1); then
+            echo "Не удалось проверить firewall командой $save: ${output%%$'\n'*}" >&2
+            result=2
+        elif [[ $output == *cascade:v2* ]]; then
             return 0
         fi
     done
-    return 1
+    if [[ $checked == 0 ]]; then
+        echo 'Нет iptables-nft-save и iptables-legacy-save: проверить firewall нельзя.' >&2
+        result=2
+    fi
+    return "$result"
+}
+
+# PIDs of running Cascade managers (open menus or commands), one per line.
+cascade_processes() {
+    local dir arg args
+    for dir in /proc/[0-9]*; do
+        [[ $(stat -c %u "$dir" 2>/dev/null) == 0 ]] || continue
+        mapfile -d '' -t args 2>/dev/null <"$dir/cmdline" || continue
+        [[ ${#args[@]} -gt 1 && ${args[0]##*/} == python3* ]] || continue
+        for arg in "${args[@]:1}"; do
+            if [[ $arg == "$PROGRAM" || $arg == "$COMMAND" ]]; then
+                echo "${dir#/proc/}"
+                break
+            fi
+        done
+    done
+    return 0
 }
 
 # Every later command, including one already waiting for this lock, reads the
 # mark after locking and stops. cascade.py never recreates a removed lock.
 deactivate() {
-    [[ -f /etc/cascade/.lock ]] || return 0
-    exec 8>>/etc/cascade/.lock || return 1
-    flock -x 8 || return 1
-    printf 'disabled\n' >&8 || return 1
+    [[ -f $CONFIG/.lock ]] || return 0
+    exec 8>>"$CONFIG/.lock" || return 1
+    if ! flock -w 90 8; then
+        exec 8>&-
+        echo "Блокировку $CONFIG/.lock не отпускает другой процесс Cascade (PID: $(cascade_processes | tr '\n' ' '))." \
+            'Закройте его и повторите удаление.' >&2
+        return 1
+    fi
+    if ! printf 'disabled\n' >&8; then
+        exec 8>&-
+        return 1
+    fi
     exec 8>&-
 }
 
 # Only Cascade's own files are removed; foreign files were rejected above.
 remove_files() {
-    if [[ -e $UNIT ]]; then
-        systemctl disable cascade.service || return 1
-    elif [[ -L $WANTS && $(readlink "$WANTS") == "$UNIT" ]]; then
-        rm -f -- "$WANTS"
+    local pids dir
+    if [[ -L $WANTS && $(readlink "$WANTS") == "$UNIT" ]]; then
+        rm -f -- "$WANTS" || return 1
     fi
     # Stopping also cancels a pending automatic restart. Without the program
-    # ExecStop cannot run, but needs_clear has already found no rules.
+    # ExecStop cannot run, but rules_present has already found no rules.
     if [[ $(systemctl show -p LoadState --value cascade.service 2>/dev/null) == loaded ]]; then
         systemctl stop cascade.service || [[ ! -f $PROGRAM ]] || return 1
         systemctl reset-failed cascade.service 2>/dev/null || true
     fi
-    rm -f -- "$UNIT" /usr/local/bin/cascade "$PROGRAM" /usr/local/lib/cascade/.cascade.py.new \
-        /etc/cascade/state.json /etc/cascade/.state-* /etc/cascade/.lock
-    # Directories stay only if someone else put files there.
-    rmdir /usr/local/lib/cascade 2>/dev/null || true
-    rmdir /etc/cascade 2>/dev/null || true
-    systemctl daemon-reload
+    rm -f -- "$UNIT" "$COMMAND" "$PROGRAM" "$LIBDIR/.cascade.py.new" \
+        "$CONFIG/state.json" "$CONFIG"/.state-* || return 1
+    # A menu opened before an upgrade still runs old code, which would
+    # recreate a missing lock without the removal mark and keep working.
+    pids=$(cascade_processes) || return 1
+    if [[ -n $pids ]]; then
+        echo "Открыты процессы Cascade (PID: ${pids//$'\n'/ })." \
+            "$CONFIG/.lock оставлен с отметкой удаления: они не смогут изменить firewall." \
+            'Закройте их и повторите удаление, чтобы убрать и этот файл.' >&2
+    else
+        rm -f -- "$CONFIG/.lock" || return 1
+    fi
+    # Directories stay only if something else is left in them.
+    rmdir "$LIBDIR" 2>/dev/null || true
+    rmdir "$CONFIG" 2>/dev/null || true
+    systemctl daemon-reload || return 1
     systemctl reset-failed cascade.service 2>/dev/null || true
+    for dir in "$LIBDIR" "$CONFIG"; do
+        if [[ -e $dir && ! ( $dir == "$CONFIG" && -n $pids ) ]]; then
+            echo "Каталог $dir не удалён: в нём есть посторонние файлы." >&2
+        fi
+    done
     return 0
 }
 
 # Shared by --uninstall and by the rollback of a first installation.
 uninstall() {
+    local found=0
     deactivate || return 1
-    if needs_clear; then
+    if [[ -e $UNIT ]]; then
+        # Even if cleanup stops below, nothing is applied again after reboot.
+        systemctl disable cascade.service || return 1
+    fi
+    rules_present || found=$?
+    if [[ $found != 1 ]]; then
         if [[ ! -f $PROGRAM ]]; then
-            echo "Найдены правила Cascade, но нет $PROGRAM. Запустите установку, затем удаление." >&2
+            if [[ $found == 0 ]]; then
+                echo "Найдены правила Cascade, но нет $PROGRAM. Запустите установку, затем удаление." >&2
+            fi
             return 1
         fi
-        /usr/bin/python3 -I "$PROGRAM" clear --yes --deactivate || return 1
+        "$PYTHON" -I "$PROGRAM" clear --yes --deactivate || return 1
+        # Never report removal while tagged rules may still be active, e.g.
+        # in the iptables variant that was selected before.
+        found=0
+        rules_present || found=$?
+        if [[ $found == 0 ]]; then
+            echo 'После очистки в firewall остались правила с меткой cascade:v2 (возможно, в другом варианте iptables).' \
+                'Удалите их вручную и повторите удаление.' >&2
+        fi
+        [[ $found == 1 ]] || return 1
     fi
     remove_files
 }
+# END REMOVAL HELPERS
 
 # A firewall snapshot saved while Cascade was active would restore it at boot.
 warn_saved() {
     local file
     for file in /etc/iptables/rules.v4 /etc/iptables.rules /etc/iptables.up.rules; do
-        if [[ -f $file ]] && grep -Fq 'cascade:v2' "$file"; then
-            echo "Внимание: $file содержит правила Cascade (cascade:v2). Загрузчик firewall вернёт их после перезагрузки." >&2
-            echo 'Удалите эти строки вручную или пересохраните текущие правила (например, netfilter-persistent save).' >&2
+        if [[ -f $file ]] && grep -Eq 'cascade:v2|^:CSCD_(DNAT|SNAT|FWD) ' "$file"; then
+            echo "Внимание: $file содержит правила или цепочки Cascade; загрузчик firewall вернёт их после перезагрузки." >&2
+            echo 'Пересохраните текущие правила (например, sudo netfilter-persistent save) или удалите из файла' \
+                'строки с cascade:v2 и объявления цепочек :CSCD_DNAT, :CSCD_SNAT, :CSCD_FWD.' >&2
         fi
     done
     return 0
@@ -125,17 +207,25 @@ warn_saved() {
 
 if [[ $ACTION == uninstall ]]; then
     installed=0
-    for path in "$PROGRAM" "$UNIT" /usr/local/bin/cascade /usr/local/lib/cascade /etc/cascade; do
+    for path in "$PROGRAM" "$UNIT" "$COMMAND" "$LIBDIR" "$CONFIG"; do
         if [[ -e $path || -L $path ]]; then installed=1; fi
     done
     if [[ -L $WANTS && $(readlink "$WANTS") == "$UNIT" ]]; then installed=1; fi
-    if [[ $installed == 0 ]] && ! needs_clear; then
-        echo 'Cascade не установлен.'
+    if [[ $installed == 0 ]]; then
+        found=0
+        rules_present || found=$?
+        if [[ $found == 1 ]]; then
+            echo 'Cascade не установлен.'
+            warn_saved
+            exit 0
+        fi
+        [[ $found == 2 ]] || echo 'Cascade не установлен, но в firewall есть правила с меткой cascade:v2. Установите Cascade и запустите удаление.' >&2
         warn_saved
-        exit 0
+        exit 1
     fi
     if ! uninstall; then
-        echo 'Удаление не завершено; файлы сохранены, команды Cascade заблокированы. Устраните ошибку выше и повторите удаление (или установку, чтобы вернуть работу).' >&2
+        echo 'Удаление не завершено (см. ошибку выше). Устраните её и повторите удаление;' \
+            'чтобы вернуть Cascade в работу, запустите установку.' >&2
         exit 1
     fi
     warn_saved
@@ -218,7 +308,7 @@ rollback() {
         if uninstall; then
             echo 'Установка не завершена; созданные файлы удалены. Проверьте ошибки выше.' >&2
         else
-            echo 'Откат не смог удалить правила Cascade. Устраните ошибку и выполните: sudo bash install.sh --uninstall' >&2
+            echo 'Откат не завершён, автозапуск отключён. Устраните ошибку выше и выполните: sudo bash install.sh --uninstall' >&2
         fi
         exit "$result"
     fi

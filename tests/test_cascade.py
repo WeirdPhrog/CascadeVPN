@@ -63,12 +63,17 @@ class PortProtection(unittest.TestCase):
         self.assertFalse(c.socket_conflict(ITEM, "LISTEN 0 4096 0.0.0.0:8444 0.0.0.0:*"))
         self.assertTrue(c.socket_conflict(ITEM, "ESTAB 0 0 10.1.0.1:8443 10.1.0.4:22"))
 
-    def test_saved_rule_ignores_outgoing_client_sockets(self):
+    def test_saved_tcp_rule_ignores_outgoing_connections(self):
         for line in ("ESTAB 0 0 10.1.0.1:8443 9.9.9.9:443", "TIME-WAIT 0 0 10.1.0.1:8443 9.9.9.9:443"):
             self.assertTrue(c.socket_conflict(ITEM, line, strict=True))
             self.assertFalse(c.socket_conflict(ITEM, line, strict=False))
-        for line in ("LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*", "UNCONN 0 0 10.1.0.1:8443 0.0.0.0:*"):
-            self.assertTrue(c.socket_conflict(ITEM, line, strict=False))
+        self.assertTrue(c.socket_conflict(ITEM, "LISTEN 0 4096 0.0.0.0:8443 0.0.0.0:*", strict=False))
+
+    def test_udp_stays_strict_for_connected_sockets(self):
+        # A UDP service may connect() its socket to a peer and keep receiving.
+        udp = dict(ITEM, proto="udp")
+        for line in ("UNCONN 0 0 10.1.0.1:8443 0.0.0.0:*", "ESTAB 0 0 10.1.0.1:8443 9.9.9.9:53"):
+            self.assertTrue(c.socket_conflict(udp, line, strict=False))
 
     def test_docker_host_port_ranges(self):
         self.assertEqual(c.host_ports("8443"), (8443, 8443))
@@ -192,6 +197,24 @@ class Menu(unittest.TestCase):
             c.menu()
         old, new = transition.call_args.args
         self.assertEqual((old["rules"], new["rules"]), ([ITEM], []))
+
+    def test_termination_signal_ends_the_menu(self):
+        # Errors keep the menu open; SIGTERM/SIGHUP must close it instead.
+        for where in ("prompt", "validation"):
+            inputs = iter(["1", "10.2.0.2"])
+
+            def answer(prompt):
+                if where == "prompt" and prompt == "> ":
+                    raise c.Interrupted("signal 15")
+                return next(inputs)
+
+            def route(_):
+                raise c.Interrupted("signal 15")
+
+            with self.subTest(where=where), patch("builtins.input", side_effect=answer), patch("builtins.print"), \
+                    patch.object(c, "route_to", side_effect=route):
+                with self.assertRaises(c.Interrupted):
+                    c.menu()
 
     def test_rule_changed_while_menu_was_waiting(self):
         with patch.object(c, "locked", side_effect=lambda: contextlib.nullcontext()), \
